@@ -16,9 +16,9 @@ from diffusers.utils import (
     PIL_INTERPOLATION,
     is_accelerate_available,
     is_accelerate_version,
-    randn_tensor,
     replace_example_docstring,
 )
+from diffusers.utils.torch_utils import randn_tensor
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -911,7 +911,7 @@ class StableDiffusionControlNetInpaintImg2ImgPipeline(DiffusionPipeline):
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
-                [diffusers.cross_attention](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/cross_attention.py).
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             controlnet_conditioning_scale (`float`, *optional*, defaults to 1.0):
                 The outputs of the controlnet are multiplied by `controlnet_conditioning_scale` before they are added
                 to the residual in the original unet.
@@ -1081,7 +1081,8 @@ class StableDiffusionControlNetInpaintImg2ImgPipeline(DiffusionPipeline):
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        callback(step_idx, t, latents)
 
         # If we do sequential model offloading, let's offload unet and controlnet
         # manually for max memory savings

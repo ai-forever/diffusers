@@ -26,7 +26,7 @@ from pathlib import PosixPath
 from typing import Any, Dict, Tuple, Union
 
 import numpy as np
-from huggingface_hub import hf_hub_download
+from huggingface_hub import create_repo, hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
 from requests import HTTPError
 
@@ -95,6 +95,7 @@ class ConfigMixin:
           should only have a `kwargs` argument if at least one argument is deprecated (should be overridden by
           subclass).
     """
+
     config_name = None
     ignore_for_config = []
     has_compatibles = False
@@ -144,6 +145,12 @@ class ConfigMixin:
         Args:
             save_directory (`str` or `os.PathLike`):
                 Directory where the configuration JSON file is saved (will be created if it does not exist).
+            push_to_hub (`bool`, *optional*, defaults to `False`):
+                Whether or not to push your model to the Hugging Face Hub after saving it. You can specify the
+                repository you want to push to with `repo_id` (will default to the name of `save_directory` in your
+                namespace).
+            kwargs (`Dict[str, Any]`, *optional*):
+                Additional keyword arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
         """
         if os.path.isfile(save_directory):
             raise AssertionError(f"Provided path ({save_directory}) should be a directory, not a file")
@@ -155,6 +162,22 @@ class ConfigMixin:
 
         self.to_json_file(output_config_file)
         logger.info(f"Configuration saved in {output_config_file}")
+
+        if push_to_hub:
+            commit_message = kwargs.pop("commit_message", None)
+            private = kwargs.pop("private", False)
+            create_pr = kwargs.pop("create_pr", False)
+            token = kwargs.pop("token", None)
+            repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
+            repo_id = create_repo(repo_id, exist_ok=True, private=private, token=token).repo_id
+
+            self._upload_folder(
+                save_directory,
+                repo_id,
+                token=token,
+                commit_message=commit_message,
+                create_pr=create_pr,
+            )
 
     @classmethod
     def from_config(cls, config: Union[FrozenDict, Dict[str, Any]] = None, return_unused_kwargs=False, **kwargs):
@@ -463,10 +486,18 @@ class ConfigMixin:
 
         # remove attributes from orig class that cannot be expected
         orig_cls_name = config_dict.pop("_class_name", cls.__name__)
-        if orig_cls_name != cls.__name__ and hasattr(diffusers_library, orig_cls_name):
+        if (
+            isinstance(orig_cls_name, str)
+            and orig_cls_name != cls.__name__
+            and hasattr(diffusers_library, orig_cls_name)
+        ):
             orig_cls = getattr(diffusers_library, orig_cls_name)
             unexpected_keys_from_orig = cls._get_init_keys(orig_cls) - expected_keys
             config_dict = {k: v for k, v in config_dict.items() if k not in unexpected_keys_from_orig}
+        elif not isinstance(orig_cls_name, str) and not isinstance(orig_cls_name, (list, tuple)):
+            raise ValueError(
+                "Make sure that the `_class_name` is of type string or list of string (for custom pipelines)."
+            )
 
         # remove private attributes
         config_dict = {k: v for k, v in config_dict.items() if not k.startswith("_")}

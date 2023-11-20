@@ -32,10 +32,18 @@ from diffusers import (
     StableDiffusionControlNetImg2ImgPipeline,
     UNet2DConditionModel,
 )
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_controlnet import MultiControlNetModel
-from diffusers.utils import floats_tensor, load_image, load_numpy, randn_tensor, slow, torch_device
+from diffusers.pipelines.controlnet.pipeline_controlnet import MultiControlNetModel
+from diffusers.utils import load_image
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.utils.testing_utils import enable_full_determinism, require_torch_gpu
+from diffusers.utils.testing_utils import (
+    enable_full_determinism,
+    floats_tensor,
+    load_numpy,
+    require_torch_gpu,
+    slow,
+    torch_device,
+)
+from diffusers.utils.torch_utils import randn_tensor
 
 from ..pipeline_params import (
     IMAGE_TO_IMAGE_IMAGE_PARAMS,
@@ -64,7 +72,7 @@ class ControlNetImg2ImgPipelineFastTests(
     def get_dummy_components(self):
         torch.manual_seed(0)
         unet = UNet2DConditionModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             sample_size=32,
             in_channels=4,
@@ -72,15 +80,17 @@ class ControlNetImg2ImgPipelineFastTests(
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
             cross_attention_dim=32,
+            norm_num_groups=1,
         )
         torch.manual_seed(0)
         controlnet = ControlNetModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             in_channels=4,
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             cross_attention_dim=32,
             conditioning_embedding_out_channels=(16, 32),
+            norm_num_groups=1,
         )
         torch.manual_seed(0)
         scheduler = DDIMScheduler(
@@ -92,12 +102,13 @@ class ControlNetImg2ImgPipelineFastTests(
         )
         torch.manual_seed(0)
         vae = AutoencoderKL(
-            block_out_channels=[32, 64],
+            block_out_channels=[4, 8],
             in_channels=3,
             out_channels=3,
             down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
             up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
             latent_channels=4,
+            norm_num_groups=2,
         )
         torch.manual_seed(0)
         text_encoder_config = CLIPTextConfig(
@@ -178,7 +189,7 @@ class StableDiffusionMultiControlNetPipelineFastTests(
     def get_dummy_components(self):
         torch.manual_seed(0)
         unet = UNet2DConditionModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             sample_size=32,
             in_channels=4,
@@ -186,6 +197,7 @@ class StableDiffusionMultiControlNetPipelineFastTests(
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
             cross_attention_dim=32,
+            norm_num_groups=1,
         )
         torch.manual_seed(0)
 
@@ -195,23 +207,25 @@ class StableDiffusionMultiControlNetPipelineFastTests(
                 m.bias.data.fill_(1.0)
 
         controlnet1 = ControlNetModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             in_channels=4,
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             cross_attention_dim=32,
             conditioning_embedding_out_channels=(16, 32),
+            norm_num_groups=1,
         )
         controlnet1.controlnet_down_blocks.apply(init_weights)
 
         torch.manual_seed(0)
         controlnet2 = ControlNetModel(
-            block_out_channels=(32, 64),
+            block_out_channels=(4, 8),
             layers_per_block=2,
             in_channels=4,
             down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
             cross_attention_dim=32,
             conditioning_embedding_out_channels=(16, 32),
+            norm_num_groups=1,
         )
         controlnet2.controlnet_down_blocks.apply(init_weights)
 
@@ -225,12 +239,13 @@ class StableDiffusionMultiControlNetPipelineFastTests(
         )
         torch.manual_seed(0)
         vae = AutoencoderKL(
-            block_out_channels=[32, 64],
+            block_out_channels=[4, 8],
             in_channels=3,
             out_channels=3,
             down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
             up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
             latent_channels=4,
+            norm_num_groups=2,
         )
         torch.manual_seed(0)
         text_encoder_config = CLIPTextConfig(
@@ -401,3 +416,49 @@ class ControlNetImg2ImgPipelineSlowTests(unittest.TestCase):
         )
 
         assert np.abs(expected_image - image).max() < 9e-2
+
+    def test_load_local(self):
+        controlnet = ControlNetModel.from_pretrained("lllyasviel/control_v11p_sd15_canny")
+        pipe_1 = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
+            "runwayml/stable-diffusion-v1-5", safety_checker=None, controlnet=controlnet
+        )
+
+        controlnet = ControlNetModel.from_single_file(
+            "https://huggingface.co/lllyasviel/ControlNet-v1-1/blob/main/control_v11p_sd15_canny.pth"
+        )
+        pipe_2 = StableDiffusionControlNetImg2ImgPipeline.from_single_file(
+            "https://huggingface.co/runwayml/stable-diffusion-v1-5/blob/main/v1-5-pruned-emaonly.safetensors",
+            safety_checker=None,
+            controlnet=controlnet,
+        )
+        control_image = load_image(
+            "https://huggingface.co/datasets/hf-internal-testing/diffusers-images/resolve/main/sd_controlnet/bird_canny.png"
+        ).resize((512, 512))
+        image = load_image(
+            "https://huggingface.co/lllyasviel/sd-controlnet-canny/resolve/main/images/bird.png"
+        ).resize((512, 512))
+
+        pipes = [pipe_1, pipe_2]
+        images = []
+        for pipe in pipes:
+            pipe.enable_model_cpu_offload()
+            pipe.set_progress_bar_config(disable=None)
+
+            generator = torch.Generator(device="cpu").manual_seed(0)
+            prompt = "bird"
+            output = pipe(
+                prompt,
+                image=image,
+                control_image=control_image,
+                strength=0.9,
+                generator=generator,
+                output_type="np",
+                num_inference_steps=3,
+            )
+            images.append(output.images[0])
+
+            del pipe
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        assert np.abs(images[0] - images[1]).max() < 1e-3

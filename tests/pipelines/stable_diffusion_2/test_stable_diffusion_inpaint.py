@@ -23,10 +23,21 @@ from PIL import Image
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 from diffusers import AutoencoderKL, PNDMScheduler, StableDiffusionInpaintPipeline, UNet2DConditionModel
-from diffusers.utils import floats_tensor, load_image, load_numpy, torch_device
-from diffusers.utils.testing_utils import enable_full_determinism, require_torch_gpu, slow
+from diffusers.utils.testing_utils import (
+    enable_full_determinism,
+    floats_tensor,
+    load_image,
+    load_numpy,
+    require_torch_gpu,
+    slow,
+    torch_device,
+)
 
-from ..pipeline_params import TEXT_GUIDED_IMAGE_INPAINTING_BATCH_PARAMS, TEXT_GUIDED_IMAGE_INPAINTING_PARAMS
+from ..pipeline_params import (
+    TEXT_GUIDED_IMAGE_INPAINTING_BATCH_PARAMS,
+    TEXT_GUIDED_IMAGE_INPAINTING_PARAMS,
+    TEXT_TO_IMAGE_CALLBACK_CFG_PARAMS,
+)
 from ..test_pipelines_common import PipelineKarrasSchedulerTesterMixin, PipelineLatentTesterMixin, PipelineTesterMixin
 
 
@@ -43,6 +54,7 @@ class StableDiffusion2InpaintPipelineFastTests(
         []
     )  # TO-DO: update image_params once pipeline is refactored with VaeImageProcessor.preprocess
     image_latents_params = frozenset([])
+    callback_cfg_params = TEXT_TO_IMAGE_CALLBACK_CFG_PARAMS.union({"mask", "masked_image_latents"})
 
     def get_dummy_components(self):
         torch.manual_seed(0)

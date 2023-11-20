@@ -12,24 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import numpy as np
-import PIL
+import PIL.Image
 import torch
 from PIL import Image
 
 from ...models import UNet2DConditionModel, VQModel
-from ...pipelines import DiffusionPipeline
-from ...pipelines.pipeline_utils import ImagePipelineOutput
 from ...schedulers import DDPMScheduler
 from ...utils import (
-    is_accelerate_available,
-    is_accelerate_version,
     logging,
-    randn_tensor,
-    replace_example_docstring,
 )
+from ...utils.torch_utils import randn_tensor
+from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -137,6 +133,8 @@ class KandinskyV22ControlnetImg2ImgPipeline(DiffusionPipeline):
             MoVQ Decoder to generate the image from the latents.
     """
 
+    model_cpu_offload_seq = "unet->movq"
+
     def __init__(
         self,
         unet: UNet2DConditionModel,
@@ -205,75 +203,7 @@ class KandinskyV22ControlnetImg2ImgPipeline(DiffusionPipeline):
 
         return latents
 
-    # Copied from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2.KandinskyV22Pipeline.enable_sequential_cpu_offload
-    def enable_sequential_cpu_offload(self, gpu_id=0):
-        r"""
-        Offloads all models to CPU using accelerate, significantly reducing memory usage. When called, the pipeline's
-        models have their state dicts saved to CPU and then are moved to a `torch.device('meta') and loaded to GPU only
-        when their specific submodule has its `forward` method called.
-        """
-        if is_accelerate_available():
-            from accelerate import cpu_offload
-        else:
-            raise ImportError("Please install accelerate via `pip install accelerate`")
-
-        device = torch.device(f"cuda:{gpu_id}")
-
-        models = [
-            self.unet,
-            self.movq,
-        ]
-        for cpu_offloaded_model in models:
-            if cpu_offloaded_model is not None:
-                cpu_offload(cpu_offloaded_model, device)
-
-    # Copied from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2.KandinskyV22Pipeline.enable_model_cpu_offload
-    def enable_model_cpu_offload(self, gpu_id=0):
-        r"""
-        Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance. Compared
-        to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU when its `forward`
-        method is called, and the model remains in GPU until the next model runs. Memory savings are lower than with
-        `enable_sequential_cpu_offload`, but performance is much better due to the iterative execution of the `unet`.
-        """
-        if is_accelerate_available() and is_accelerate_version(">=", "0.17.0.dev0"):
-            from accelerate import cpu_offload_with_hook
-        else:
-            raise ImportError("`enable_model_cpu_offload` requires `accelerate v0.17.0` or higher.")
-
-        device = torch.device(f"cuda:{gpu_id}")
-
-        if self.device.type != "cpu":
-            self.to("cpu", silence_dtype_warnings=True)
-            torch.cuda.empty_cache()  # otherwise we don't see the memory savings (but they probably exist)
-
-        hook = None
-        for cpu_offloaded_model in [self.unet, self.movq]:
-            _, hook = cpu_offload_with_hook(cpu_offloaded_model, device, prev_module_hook=hook)
-
-        # We'll offload the last model manually.
-        self.final_offload_hook = hook
-
-    @property
-    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._execution_device
-    def _execution_device(self):
-        r"""
-        Returns the device on which the pipeline's models will be executed. After calling
-        `pipeline.enable_sequential_cpu_offload()` the execution device can only be inferred from Accelerate's module
-        hooks.
-        """
-        if not hasattr(self.unet, "_hf_hook"):
-            return self.device
-        for module in self.unet.modules():
-            if (
-                hasattr(module, "_hf_hook")
-                and hasattr(module._hf_hook, "execution_device")
-                and module._hf_hook.execution_device is not None
-            ):
-                return torch.device(module._hf_hook.execution_device)
-        return self.device
-
     @torch.no_grad()
-    @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
         image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]],
@@ -288,6 +218,8 @@ class KandinskyV22ControlnetImg2ImgPipeline(DiffusionPipeline):
         num_images_per_prompt: int = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         output_type: Optional[str] = "pil",
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
         return_dict: bool = True,
     ):
         """
@@ -298,7 +230,7 @@ class KandinskyV22ControlnetImg2ImgPipeline(DiffusionPipeline):
                 The clip image embeddings for text prompt, that will be used to condition the image generation.
             image (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, or `List[np.ndarray]`):
                 `Image`, or tensor representing an image batch, that will be used as the starting point for the
-                process. Can also accpet image latents as `image`, if passing latents directly, it will not be encoded
+                process. Can also accept image latents as `image`, if passing latents directly, it will not be encoded
                 again.
             strength (`float`, *optional*, defaults to 0.8):
                 Conceptually, indicates how much to transform the reference `image`. Must be between 0 and 1. `image`
@@ -331,6 +263,12 @@ class KandinskyV22ControlnetImg2ImgPipeline(DiffusionPipeline):
             output_type (`str`, *optional*, defaults to `"pil"`):
                 The output format of the generate image. Choose between: `"pil"` (`PIL.Image.Image`), `"np"`
                 (`np.array`) or `"pt"` (`torch.Tensor`).
+            callback (`Callable`, *optional*):
+                A function that calls every `callback_steps` steps during inference. The function is called with the
+                following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function is called. If not specified, the callback is called at
+                every step.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~pipelines.ImagePipelineOutput`] instead of a plain tuple.
 
@@ -357,8 +295,10 @@ class KandinskyV22ControlnetImg2ImgPipeline(DiffusionPipeline):
             negative_image_embeds = negative_image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
             hint = hint.repeat_interleave(num_images_per_prompt, dim=0)
 
-        image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0).to(dtype=self.unet.dtype, device=device)
-        hint = torch.cat([hint, hint], dim=0).to(dtype=self.unet.dtype, device=device)
+            image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0).to(
+                dtype=self.unet.dtype, device=device
+            )
+            hint = torch.cat([hint, hint], dim=0).to(dtype=self.unet.dtype, device=device)
 
         if not isinstance(image, list):
             image = [image]
@@ -414,8 +354,15 @@ class KandinskyV22ControlnetImg2ImgPipeline(DiffusionPipeline):
                 generator=generator,
             )[0]
 
+            if callback is not None and i % callback_steps == 0:
+                step_idx = i // getattr(self.scheduler, "order", 1)
+                callback(step_idx, t, latents)
+
         # post-processing
         image = self.movq.decode(latents, force_not_quantize=True)["sample"]
+
+        # Offload all models
+        self.maybe_free_model_hooks()
 
         if output_type not in ["pt", "np", "pil"]:
             raise ValueError(f"Only the output types `pt`, `pil` and `np` are supported not output_type={output_type}")

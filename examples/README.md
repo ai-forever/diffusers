@@ -19,7 +19,7 @@ Diffusers examples are a collection of scripts to demonstrate how to effectively
 for a variety of use cases involving training or fine-tuning.
 
 **Note**: If you are looking for **official** examples on how to use `diffusers` for inference, 
-please have a look at [src/diffusers/pipelines](https://github.com/huggingface/diffusers/tree/main/src/diffusers/pipelines)
+please have a look at [src/diffusers/pipelines](https://github.com/huggingface/diffusers/tree/main/src/diffusers/pipelines).
 
 Our examples aspire to be **self-contained**, **easy-to-tweak**, **beginner-friendly** and for **one-purpose-only**.
 More specifically, this means:
@@ -44,7 +44,7 @@ Training examples show how to pretrain or fine-tune diffusion models for a varie
 | [**Dreambooth**](./dreambooth) | ✅ | - | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffusers/sd_dreambooth_training.ipynb)
 | [**ControlNet**](./controlnet) | ✅ | ✅ | -
 | [**InstructPix2Pix**](./instruct_pix2pix) | ✅ | ✅ | -
-| [**Reinforcement Learning for Control**](https://github.com/huggingface/diffusers/blob/main/examples/rl/run_diffusers_locomotion.py)                    | - | - | coming soon.
+| [**Reinforcement Learning for Control**](https://github.com/huggingface/diffusers/blob/main/examples/reinforcement_learning/run_diffusers_locomotion.py)                    | - | - | coming soon.
 
 ## Community
 

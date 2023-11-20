@@ -3,7 +3,7 @@ import re
 from typing import Callable, List, Optional, Union
 
 import numpy as np
-import PIL
+import PIL.Image
 import torch
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPTokenizer
@@ -82,10 +82,10 @@ def parse_prompt_attention(text):
       (abc) - increases attention to abc by a multiplier of 1.1
       (abc:3.12) - increases attention to abc by a multiplier of 3.12
       [abc] - decreases attention to abc by a multiplier of 1.1
-      \( - literal character '('
-      \[ - literal character '['
-      \) - literal character ')'
-      \] - literal character ']'
+      \\( - literal character '('
+      \\[ - literal character '['
+      \\) - literal character ')'
+      \\] - literal character ']'
       \\ - literal character '\'
       anything else - just text
     >>> parse_prompt_attention('normal text')
@@ -94,7 +94,7 @@ def parse_prompt_attention(text):
     [['an ', 1.0], ['important', 1.1], [' word', 1.0]]
     >>> parse_prompt_attention('(unbalanced')
     [['unbalanced', 1.1]]
-    >>> parse_prompt_attention('\(literal\]')
+    >>> parse_prompt_attention('\\(literal\\]')
     [['(literal]', 1.0]]
     >>> parse_prompt_attention('(unnecessary)(parens)')
     [['unnecessaryparens', 1.1]]
@@ -433,6 +433,7 @@ class OnnxStableDiffusionLongPromptWeightingPipeline(OnnxStableDiffusionPipeline
     This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
     library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
     """
+
     if version.parse(version.parse(diffusers.__version__).base_version) >= version.parse("0.9.0"):
 
         def __init__(
@@ -846,7 +847,8 @@ class OnnxStableDiffusionLongPromptWeightingPipeline(OnnxStableDiffusionPipeline
             # call the callback, if provided
             if i % callback_steps == 0:
                 if callback is not None:
-                    callback(i, t, latents)
+                    step_idx = i // getattr(self.scheduler, "order", 1)
+                    callback(step_idx, t, latents)
                 if is_cancelled_callback is not None and is_cancelled_callback():
                     return None
 

@@ -13,25 +13,21 @@
 # limitations under the License.
 
 from copy import deepcopy
-from typing import List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
-import PIL
+import PIL.Image
 import torch
 import torch.nn.functional as F
+from packaging import version
 from PIL import Image
 
+from ... import __version__
 from ...models import UNet2DConditionModel, VQModel
-from ...pipelines import DiffusionPipeline
-from ...pipelines.pipeline_utils import ImagePipelineOutput
 from ...schedulers import DDPMScheduler
-from ...utils import (
-    is_accelerate_available,
-    is_accelerate_version,
-    logging,
-    randn_tensor,
-    replace_example_docstring,
-)
+from ...utils import deprecate, logging
+from ...utils.torch_utils import randn_tensor
+from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -62,8 +58,8 @@ EXAMPLE_DOC_STRING = """
         ...     "/kandinsky/cat.png"
         ... )
 
-        >>> mask = np.ones((768, 768), dtype=np.float32)
-        >>> mask[:250, 250:-250] = 0
+        >>> mask = np.zeros((768, 768), dtype=np.float32)
+        >>> mask[:250, 250:-250] = 1
 
         >>> out = pipe(
         ...     image=init_image,
@@ -231,6 +227,8 @@ def prepare_mask_and_masked_image(image, mask, height, width):
         mask[mask >= 0.5] = 1
         mask = torch.from_numpy(mask)
 
+    mask = 1 - mask
+
     return mask, image
 
 
@@ -250,6 +248,9 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
             MoVQ Decoder to generate the image from the latents.
     """
 
+    model_cpu_offload_seq = "unet->movq"
+    _callback_tensor_inputs = ["latents", "image_embeds", "negative_image_embeds", "masked_image", "mask_image"]
+
     def __init__(
         self,
         unet: UNet2DConditionModel,
@@ -264,6 +265,7 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
             movq=movq,
         )
         self.movq_scale_factor = 2 ** (len(self.movq.config.block_out_channels) - 1)
+        self._warn_has_been_called = False
 
     # Copied from diffusers.pipelines.unclip.pipeline_unclip.UnCLIPPipeline.prepare_latents
     def prepare_latents(self, shape, dtype, device, generator, latents, scheduler):
@@ -277,75 +279,19 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
         latents = latents * scheduler.init_noise_sigma
         return latents
 
-    # Copied from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2.KandinskyV22Pipeline.enable_sequential_cpu_offload
-    def enable_sequential_cpu_offload(self, gpu_id=0):
-        r"""
-        Offloads all models to CPU using accelerate, significantly reducing memory usage. When called, the pipeline's
-        models have their state dicts saved to CPU and then are moved to a `torch.device('meta') and loaded to GPU only
-        when their specific submodule has its `forward` method called.
-        """
-        if is_accelerate_available():
-            from accelerate import cpu_offload
-        else:
-            raise ImportError("Please install accelerate via `pip install accelerate`")
-
-        device = torch.device(f"cuda:{gpu_id}")
-
-        models = [
-            self.unet,
-            self.movq,
-        ]
-        for cpu_offloaded_model in models:
-            if cpu_offloaded_model is not None:
-                cpu_offload(cpu_offloaded_model, device)
-
-    # Copied from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2.KandinskyV22Pipeline.enable_model_cpu_offload
-    def enable_model_cpu_offload(self, gpu_id=0):
-        r"""
-        Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance. Compared
-        to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU when its `forward`
-        method is called, and the model remains in GPU until the next model runs. Memory savings are lower than with
-        `enable_sequential_cpu_offload`, but performance is much better due to the iterative execution of the `unet`.
-        """
-        if is_accelerate_available() and is_accelerate_version(">=", "0.17.0.dev0"):
-            from accelerate import cpu_offload_with_hook
-        else:
-            raise ImportError("`enable_model_cpu_offload` requires `accelerate v0.17.0` or higher.")
-
-        device = torch.device(f"cuda:{gpu_id}")
-
-        if self.device.type != "cpu":
-            self.to("cpu", silence_dtype_warnings=True)
-            torch.cuda.empty_cache()  # otherwise we don't see the memory savings (but they probably exist)
-
-        hook = None
-        for cpu_offloaded_model in [self.unet, self.movq]:
-            _, hook = cpu_offload_with_hook(cpu_offloaded_model, device, prev_module_hook=hook)
-
-        # We'll offload the last model manually.
-        self.final_offload_hook = hook
+    @property
+    def guidance_scale(self):
+        return self._guidance_scale
 
     @property
-    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._execution_device
-    def _execution_device(self):
-        r"""
-        Returns the device on which the pipeline's models will be executed. After calling
-        `pipeline.enable_sequential_cpu_offload()` the execution device can only be inferred from Accelerate's module
-        hooks.
-        """
-        if not hasattr(self.unet, "_hf_hook"):
-            return self.device
-        for module in self.unet.modules():
-            if (
-                hasattr(module, "_hf_hook")
-                and hasattr(module._hf_hook, "execution_device")
-                and module._hf_hook.execution_device is not None
-            ):
-                return torch.device(module._hf_hook.execution_device)
-        return self.device
+    def do_classifier_free_guidance(self):
+        return self._guidance_scale > 1
+
+    @property
+    def num_timesteps(self):
+        return self._num_timesteps
 
     @torch.no_grad()
-    @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
         image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]],
@@ -361,18 +307,22 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
         latents: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
+        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        **kwargs,
     ):
         """
-        Args:
         Function invoked when calling the pipeline for generation.
+
+        Args:
             image_embeds (`torch.FloatTensor` or `List[torch.FloatTensor]`):
                 The clip image embeddings for text prompt, that will be used to condition the image generation.
             image (`PIL.Image.Image`):
                 `Image`, or tensor representing an image batch which will be inpainted, *i.e.* parts of the image will
                 be masked out with `mask_image` and repainted according to `prompt`.
             mask_image (`np.array`):
-                Tensor representing an image batch, to mask `image`. Black pixels in the mask will be repainted, while
-                white pixels will be preserved. If `mask_image` is a PIL image, it will be converted to a single
+                Tensor representing an image batch, to mask `image`. White pixels in the mask will be repainted, while
+                black pixels will be preserved. If `mask_image` is a PIL image, it will be converted to a single
                 channel (luminance) before use. If it's a tensor, it should contain one color channel (L) instead of 3,
                 so the expected shape would be `(B, H, W, 1)`.
             negative_image_embeds (`torch.FloatTensor` or `List[torch.FloatTensor]`):
@@ -404,15 +354,60 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
                 (`np.array`) or `"pt"` (`torch.Tensor`).
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~pipelines.ImagePipelineOutput`] instead of a plain tuple.
+            callback_on_step_end (`Callable`, *optional*):
+                A function that calls at the end of each denoising steps during the inference. The function is called
+                with the following arguments: `callback_on_step_end(self: DiffusionPipeline, step: int, timestep: int,
+                callback_kwargs: Dict)`. `callback_kwargs` will include a list of all tensors as specified by
+                `callback_on_step_end_tensor_inputs`.
+            callback_on_step_end_tensor_inputs (`List`, *optional*):
+                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
+                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
+                `._callback_tensor_inputs` attribute of your pipeline class.
 
         Examples:
 
         Returns:
             [`~pipelines.ImagePipelineOutput`] or `tuple`
         """
-        device = self._execution_device
+        if not self._warn_has_been_called and version.parse(version.parse(__version__).base_version) < version.parse(
+            "0.23.0.dev0"
+        ):
+            logger.warn(
+                "Please note that the expected format of `mask_image` has recently been changed. "
+                "Before diffusers == 0.19.0, Kandinsky Inpainting pipelines repainted black pixels and preserved black pixels. "
+                "As of diffusers==0.19.0 this behavior has been inverted. Now white pixels are repainted and black pixels are preserved. "
+                "This way, Kandinsky's masking behavior is aligned with Stable Diffusion. "
+                "THIS means that you HAVE to invert the input mask to have the same behavior as before as explained in https://github.com/huggingface/diffusers/pull/4207. "
+                "This warning will be surpressed after the first inference call and will be removed in diffusers>0.23.0"
+            )
+            self._warn_has_been_called = True
 
-        do_classifier_free_guidance = guidance_scale > 1.0
+        callback = kwargs.pop("callback", None)
+        callback_steps = kwargs.pop("callback_steps", None)
+
+        if callback is not None:
+            deprecate(
+                "callback",
+                "1.0.0",
+                "Passing `callback` as an input argument to `__call__` is deprecated, consider use `callback_on_step_end`",
+            )
+        if callback_steps is not None:
+            deprecate(
+                "callback_steps",
+                "1.0.0",
+                "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider use `callback_on_step_end`",
+            )
+
+        if callback_on_step_end_tensor_inputs is not None and not all(
+            k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
+        ):
+            raise ValueError(
+                f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
+            )
+
+        self._guidance_scale = guidance_scale
+
+        device = self._execution_device
 
         if isinstance(image_embeds, list):
             image_embeds = torch.cat(image_embeds, dim=0)
@@ -420,14 +415,16 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
         if isinstance(negative_image_embeds, list):
             negative_image_embeds = torch.cat(negative_image_embeds, dim=0)
 
-        if do_classifier_free_guidance:
+        if self.do_classifier_free_guidance:
             image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
             negative_image_embeds = negative_image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
 
-        image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0).to(dtype=self.unet.dtype, device=device)
+            image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0).to(
+                dtype=self.unet.dtype, device=device
+            )
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps_tensor = self.scheduler.timesteps
+        timesteps = self.scheduler.timesteps
 
         # preprocess image and mask
         mask_image, image = prepare_mask_and_masked_image(image, mask_image, height, width)
@@ -448,7 +445,7 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
 
         mask_image = mask_image.repeat_interleave(num_images_per_prompt, dim=0)
         masked_image = masked_image.repeat_interleave(num_images_per_prompt, dim=0)
-        if do_classifier_free_guidance:
+        if self.do_classifier_free_guidance:
             mask_image = mask_image.repeat(2, 1, 1, 1)
             masked_image = masked_image.repeat(2, 1, 1, 1)
 
@@ -466,9 +463,11 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
             self.scheduler,
         )
         noise = torch.clone(latents)
-        for i, t in enumerate(self.progress_bar(timesteps_tensor)):
+
+        self._num_timesteps = len(timesteps)
+        for i, t in enumerate(self.progress_bar(timesteps)):
             # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
             latent_model_input = torch.cat([latent_model_input, masked_image, mask_image], dim=1)
 
             added_cond_kwargs = {"image_embeds": image_embeds}
@@ -480,11 +479,11 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
                 return_dict=False,
             )[0]
 
-            if do_classifier_free_guidance:
+            if self.do_classifier_free_guidance:
                 noise_pred, variance_pred = noise_pred.split(latents.shape[1], dim=1)
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 _, variance_pred_text = variance_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
                 noise_pred = torch.cat([noise_pred, variance_pred_text], dim=1)
 
             if not (
@@ -503,27 +502,53 @@ class KandinskyV22InpaintPipeline(DiffusionPipeline):
             init_latents_proper = image[:1]
             init_mask = mask_image[:1]
 
-            if i < len(timesteps_tensor) - 1:
-                noise_timestep = timesteps_tensor[i + 1]
+            if i < len(timesteps) - 1:
+                noise_timestep = timesteps[i + 1]
                 init_latents_proper = self.scheduler.add_noise(
                     init_latents_proper, noise, torch.tensor([noise_timestep])
                 )
 
             latents = init_mask * init_latents_proper + (1 - init_mask) * latents
+
+            if callback_on_step_end is not None:
+                callback_kwargs = {}
+                for k in callback_on_step_end_tensor_inputs:
+                    callback_kwargs[k] = locals()[k]
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                latents = callback_outputs.pop("latents", latents)
+                image_embeds = callback_outputs.pop("image_embeds", image_embeds)
+                negative_image_embeds = callback_outputs.pop("negative_image_embeds", negative_image_embeds)
+                masked_image = callback_outputs.pop("masked_image", masked_image)
+                mask_image = callback_outputs.pop("mask_image", mask_image)
+
+            if callback is not None and i % callback_steps == 0:
+                step_idx = i // getattr(self.scheduler, "order", 1)
+                callback(step_idx, t, latents)
+
         # post-processing
         latents = mask_image[:1] * image[:1] + (1 - mask_image[:1]) * latents
-        image = self.movq.decode(latents, force_not_quantize=True)["sample"]
 
-        if output_type not in ["pt", "np", "pil"]:
-            raise ValueError(f"Only the output types `pt`, `pil` and `np` are supported not output_type={output_type}")
+        if output_type not in ["pt", "np", "pil", "latent"]:
+            raise ValueError(
+                f"Only the output types `pt`, `pil`, `np` and `latent` are supported not output_type={output_type}"
+            )
 
-        if output_type in ["np", "pil"]:
-            image = image * 0.5 + 0.5
-            image = image.clamp(0, 1)
-            image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        if not output_type == "latent":
+            image = self.movq.decode(latents, force_not_quantize=True)["sample"]
 
-        if output_type == "pil":
-            image = self.numpy_to_pil(image)
+            if output_type in ["np", "pil"]:
+                image = image * 0.5 + 0.5
+                image = image.clamp(0, 1)
+                image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+
+            if output_type == "pil":
+                image = self.numpy_to_pil(image)
+        else:
+            image = latents
+
+        # Offload all models
+        self.maybe_free_model_hooks()
 
         if not return_dict:
             return (image,)

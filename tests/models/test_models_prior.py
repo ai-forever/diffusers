@@ -21,8 +21,7 @@ import torch
 from parameterized import parameterized
 
 from diffusers import PriorTransformer
-from diffusers.utils import floats_tensor, slow, torch_all_close, torch_device
-from diffusers.utils.testing_utils import enable_full_determinism
+from diffusers.utils.testing_utils import enable_full_determinism, floats_tensor, slow, torch_all_close, torch_device
 
 from .test_modeling_common import ModelTesterMixin
 
@@ -163,8 +162,8 @@ class PriorTransformerIntegrationTests(unittest.TestCase):
     @parameterized.expand(
         [
             # fmt: off
-            [13, [-0.5861,  0.1283, -0.0931,  0.0882,  0.4476,  0.1329, -0.0498,  0.0640]],
-            [37, [-0.4913,  0.0110, -0.0483,  0.0541,  0.4954, -0.0170,  0.0354,  0.1651]],
+            [13, [-0.5861, 0.1283, -0.0931, 0.0882, 0.4476, 0.1329, -0.0498, 0.0640]],
+            [37, [-0.4913, 0.0110, -0.0483, 0.0541, 0.4954, -0.0170, 0.0354, 0.1651]],
             # fmt: on
         ]
     )

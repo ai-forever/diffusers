@@ -32,10 +32,19 @@ from diffusers import (
     StableDiffusionControlNetInpaintPipeline,
     UNet2DConditionModel,
 )
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_controlnet import MultiControlNetModel
-from diffusers.utils import floats_tensor, load_image, load_numpy, randn_tensor, slow, torch_device
+from diffusers.pipelines.controlnet.pipeline_controlnet import MultiControlNetModel
+from diffusers.utils import load_image
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.utils.testing_utils import enable_full_determinism, require_torch_gpu
+from diffusers.utils.testing_utils import (
+    enable_full_determinism,
+    floats_tensor,
+    load_numpy,
+    numpy_cosine_similarity_distance,
+    require_torch_gpu,
+    slow,
+    torch_device,
+)
+from diffusers.utils.torch_utils import randn_tensor
 
 from ..pipeline_params import (
     TEXT_GUIDED_IMAGE_INPAINTING_BATCH_PARAMS,
@@ -542,4 +551,55 @@ class ControlNetInpaintPipelineSlowTests(unittest.TestCase):
             "https://huggingface.co/datasets/hf-internal-testing/diffusers-images/resolve/main/sd_controlnet/boy_ray_ban.npy"
         )
 
-        assert np.abs(expected_image - image).max() < 9e-2
+        assert numpy_cosine_similarity_distance(expected_image.flatten(), image.flatten()) < 1e-2
+
+    def test_load_local(self):
+        controlnet = ControlNetModel.from_pretrained("lllyasviel/control_v11p_sd15_canny")
+        pipe_1 = StableDiffusionControlNetInpaintPipeline.from_pretrained(
+            "runwayml/stable-diffusion-v1-5", safety_checker=None, controlnet=controlnet
+        )
+
+        controlnet = ControlNetModel.from_single_file(
+            "https://huggingface.co/lllyasviel/ControlNet-v1-1/blob/main/control_v11p_sd15_canny.pth"
+        )
+        pipe_2 = StableDiffusionControlNetInpaintPipeline.from_single_file(
+            "https://huggingface.co/runwayml/stable-diffusion-v1-5/blob/main/v1-5-pruned-emaonly.safetensors",
+            safety_checker=None,
+            controlnet=controlnet,
+        )
+        control_image = load_image(
+            "https://huggingface.co/datasets/hf-internal-testing/diffusers-images/resolve/main/sd_controlnet/bird_canny.png"
+        ).resize((512, 512))
+        image = load_image(
+            "https://huggingface.co/lllyasviel/sd-controlnet-canny/resolve/main/images/bird.png"
+        ).resize((512, 512))
+        mask_image = load_image(
+            "https://huggingface.co/datasets/diffusers/test-arrays/resolve/main"
+            "/stable_diffusion_inpaint/input_bench_mask.png"
+        ).resize((512, 512))
+
+        pipes = [pipe_1, pipe_2]
+        images = []
+        for pipe in pipes:
+            pipe.enable_model_cpu_offload()
+            pipe.set_progress_bar_config(disable=None)
+
+            generator = torch.Generator(device="cpu").manual_seed(0)
+            prompt = "bird"
+            output = pipe(
+                prompt,
+                image=image,
+                control_image=control_image,
+                mask_image=mask_image,
+                strength=0.9,
+                generator=generator,
+                output_type="np",
+                num_inference_steps=3,
+            )
+            images.append(output.images[0])
+
+            del pipe
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        assert np.abs(images[0] - images[1]).max() < 1e-3

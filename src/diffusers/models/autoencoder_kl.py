@@ -18,8 +18,16 @@ import torch
 import torch.nn as nn
 
 from ..configuration_utils import ConfigMixin, register_to_config
-from ..utils import BaseOutput, apply_forward_hook
-from .attention_processor import AttentionProcessor, AttnProcessor
+from ..loaders import FromOriginalVAEMixin
+from ..utils import BaseOutput
+from ..utils.accelerate_utils import apply_forward_hook
+from .attention_processor import (
+    ADDED_KV_ATTENTION_PROCESSORS,
+    CROSS_ATTENTION_PROCESSORS,
+    AttentionProcessor,
+    AttnAddedKVProcessor,
+    AttnProcessor,
+)
 from .modeling_utils import ModelMixin
 from .vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
 
@@ -38,7 +46,7 @@ class AutoencoderKLOutput(BaseOutput):
     latent_dist: "DiagonalGaussianDistribution"
 
 
-class AutoencoderKL(ModelMixin, ConfigMixin):
+class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
     r"""
     A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
 
@@ -64,6 +72,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
             diffusion model. When decoding, the latents are scaled back to the original scale with the formula: `z = 1
             / scaling_factor * z`. For more details, refer to sections 4.3.2 and D.1 of the [High-Resolution Image
             Synthesis with Latent Diffusion Models](https://arxiv.org/abs/2112.10752) paper.
+        force_upcast (`bool`, *optional*, default to `True`):
+            If enabled it will force the VAE to run in float32 for high image resolution pipelines, such as SD-XL. VAE
+            can be fine-tuned / trained to a lower range without loosing too much precision in which case
+            `force_upcast` can be set to `False` - see: https://huggingface.co/madebyollin/sdxl-vae-fp16-fix
     """
 
     _supports_gradient_checkpointing = True
@@ -82,6 +94,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         norm_num_groups: int = 32,
         sample_size: int = 32,
         scaling_factor: float = 0.18215,
+        force_upcast: float = True,
     ):
         super().__init__()
 
@@ -169,8 +182,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         processors = {}
 
         def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttentionProcessor]):
-            if hasattr(module, "set_processor"):
-                processors[f"{name}.processor"] = module.processor
+            if hasattr(module, "get_processor"):
+                processors[f"{name}.processor"] = module.get_processor(return_deprecated_lora=True)
 
             for sub_name, child in module.named_children():
                 fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
@@ -183,7 +196,9 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         return processors
 
     # Copied from diffusers.models.unet_2d_condition.UNet2DConditionModel.set_attn_processor
-    def set_attn_processor(self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]):
+    def set_attn_processor(
+        self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]], _remove_lora=False
+    ):
         r"""
         Sets the attention processor to use to compute attention.
 
@@ -207,9 +222,9 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
             if hasattr(module, "set_processor"):
                 if not isinstance(processor, dict):
-                    module.set_processor(processor)
+                    module.set_processor(processor, _remove_lora=_remove_lora)
                 else:
-                    module.set_processor(processor.pop(f"{name}.processor"))
+                    module.set_processor(processor.pop(f"{name}.processor"), _remove_lora=_remove_lora)
 
             for sub_name, child in module.named_children():
                 fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)
@@ -222,10 +237,33 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         """
         Disables custom attention processors and sets the default attention implementation.
         """
-        self.set_attn_processor(AttnProcessor())
+        if all(proc.__class__ in ADDED_KV_ATTENTION_PROCESSORS for proc in self.attn_processors.values()):
+            processor = AttnAddedKVProcessor()
+        elif all(proc.__class__ in CROSS_ATTENTION_PROCESSORS for proc in self.attn_processors.values()):
+            processor = AttnProcessor()
+        else:
+            raise ValueError(
+                f"Cannot call `set_default_attn_processor` when attention processors are of type {next(iter(self.attn_processors.values()))}"
+            )
+
+        self.set_attn_processor(processor, _remove_lora=True)
 
     @apply_forward_hook
-    def encode(self, x: torch.FloatTensor, return_dict: bool = True) -> AutoencoderKLOutput:
+    def encode(
+        self, x: torch.FloatTensor, return_dict: bool = True
+    ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
+        """
+        Encode a batch of images into latents.
+
+        Args:
+            x (`torch.FloatTensor`): Input batch of images.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether to return a [`~models.autoencoder_kl.AutoencoderKLOutput`] instead of a plain tuple.
+
+        Returns:
+                The latent representations of the encoded images. If `return_dict` is True, a
+                [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is returned.
+        """
         if self.use_tiling and (x.shape[-1] > self.tile_sample_min_size or x.shape[-2] > self.tile_sample_min_size):
             return self.tiled_encode(x, return_dict=return_dict)
 
@@ -256,7 +294,23 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         return DecoderOutput(sample=dec)
 
     @apply_forward_hook
-    def decode(self, z: torch.FloatTensor, return_dict: bool = True) -> Union[DecoderOutput, torch.FloatTensor]:
+    def decode(
+        self, z: torch.FloatTensor, return_dict: bool = True, generator=None
+    ) -> Union[DecoderOutput, torch.FloatTensor]:
+        """
+        Decode a batch of images.
+
+        Args:
+            z (`torch.FloatTensor`): Input batch of latent vectors.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether to return a [`~models.vae.DecoderOutput`] instead of a plain tuple.
+
+        Returns:
+            [`~models.vae.DecoderOutput`] or `tuple`:
+                If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
+                returned.
+
+        """
         if self.use_slicing and z.shape[0] > 1:
             decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
             decoded = torch.cat(decoded_slices)
@@ -268,13 +322,13 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
 
         return DecoderOutput(sample=decoded)
 
-    def blend_v(self, a, b, blend_extent):
+    def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
         blend_extent = min(a.shape[2], b.shape[2], blend_extent)
         for y in range(blend_extent):
             b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, y, :] * (y / blend_extent)
         return b
 
-    def blend_h(self, a, b, blend_extent):
+    def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
         blend_extent = min(a.shape[3], b.shape[3], blend_extent)
         for x in range(blend_extent):
             b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, x] * (x / blend_extent)

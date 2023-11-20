@@ -21,8 +21,7 @@ from transformers import CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokeni
 
 from diffusers import HeunDiscreteScheduler, PriorTransformer, ShapEPipeline
 from diffusers.pipelines.shap_e import ShapERenderer
-from diffusers.utils import load_numpy, slow
-from diffusers.utils.testing_utils import require_torch_gpu, torch_device
+from diffusers.utils.testing_utils import load_numpy, nightly, require_torch_gpu, torch_device
 
 from ..test_pipelines_common import PipelineTesterMixin, assert_mean_pixel_difference
 
@@ -45,11 +44,11 @@ class ShapEPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
     @property
     def text_embedder_hidden_size(self):
-        return 32
+        return 16
 
     @property
     def time_input_dim(self):
-        return 32
+        return 16
 
     @property
     def time_embed_dim(self):
@@ -131,7 +130,7 @@ class ShapEPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         prior = self.dummy_prior
         text_encoder = self.dummy_text_encoder
         tokenizer = self.dummy_tokenizer
-        renderer = self.dummy_renderer
+        shap_e_renderer = self.dummy_renderer
 
         scheduler = HeunDiscreteScheduler(
             beta_schedule="exp",
@@ -145,7 +144,7 @@ class ShapEPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             "prior": prior,
             "text_encoder": text_encoder,
             "tokenizer": tokenizer,
-            "renderer": renderer,
+            "shap_e_renderer": shap_e_renderer,
             "scheduler": scheduler,
         }
 
@@ -161,7 +160,7 @@ class ShapEPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             "generator": generator,
             "num_inference_steps": 1,
             "frame_size": 32,
-            "output_type": "np",
+            "output_type": "latent",
         }
         return inputs
 
@@ -177,24 +176,12 @@ class ShapEPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
         output = pipe(**self.get_dummy_inputs(device))
         image = output.images[0]
-        image_slice = image[0, -3:, -3:, -1]
+        image = image.cpu().numpy()
+        image_slice = image[-3:, -3:]
 
-        assert image.shape == (20, 32, 32, 3)
+        assert image.shape == (32, 16)
 
-        expected_slice = np.array(
-            [
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-            ]
-        )
-
+        expected_slice = np.array([-1.0000, -0.6241, 1.0000, -0.8978, -0.6866, 0.7876, -0.7473, -0.2874, 0.6103])
         assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
 
     def test_inference_batch_consistent(self):
@@ -202,14 +189,7 @@ class ShapEPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         self._test_inference_batch_consistent(batch_sizes=[1, 2])
 
     def test_inference_batch_single_identical(self):
-        test_max_difference = torch_device == "cpu"
-        relax_max_difference = True
-
-        self._test_inference_batch_single_identical(
-            batch_size=2,
-            test_max_difference=test_max_difference,
-            relax_max_difference=relax_max_difference,
-        )
+        self._test_inference_batch_single_identical(batch_size=2, expected_max_diff=6e-3)
 
     def test_num_images_per_prompt(self):
         components = self.get_dummy_components()
@@ -230,8 +210,18 @@ class ShapEPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
         assert images.shape[0] == batch_size * num_images_per_prompt
 
+    def test_float16_inference(self):
+        super().test_float16_inference(expected_max_diff=5e-1)
 
-@slow
+    def test_save_load_local(self):
+        super().test_save_load_local(expected_max_difference=5e-3)
+
+    @unittest.skip("Key error is raised with accelerate")
+    def test_sequential_cpu_offload_forward_pass(self):
+        pass
+
+
+@nightly
 @require_torch_gpu
 class ShapEPipelineIntegrationTests(unittest.TestCase):
     def tearDown(self):

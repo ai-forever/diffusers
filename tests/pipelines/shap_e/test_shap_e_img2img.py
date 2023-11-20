@@ -22,8 +22,14 @@ from transformers import CLIPImageProcessor, CLIPVisionConfig, CLIPVisionModel
 
 from diffusers import HeunDiscreteScheduler, PriorTransformer, ShapEImg2ImgPipeline
 from diffusers.pipelines.shap_e import ShapERenderer
-from diffusers.utils import floats_tensor, load_image, load_numpy, slow
-from diffusers.utils.testing_utils import require_torch_gpu, torch_device
+from diffusers.utils.testing_utils import (
+    floats_tensor,
+    load_image,
+    load_numpy,
+    nightly,
+    require_torch_gpu,
+    torch_device,
+)
 
 from ..test_pipelines_common import PipelineTesterMixin, assert_mean_pixel_difference
 
@@ -46,11 +52,11 @@ class ShapEImg2ImgPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
     @property
     def text_embedder_hidden_size(self):
-        return 32
+        return 16
 
     @property
     def time_input_dim(self):
-        return 32
+        return 16
 
     @property
     def time_embed_dim(self):
@@ -65,10 +71,10 @@ class ShapEImg2ImgPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         torch.manual_seed(0)
         config = CLIPVisionConfig(
             hidden_size=self.text_embedder_hidden_size,
-            image_size=64,
+            image_size=32,
             projection_dim=self.text_embedder_hidden_size,
-            intermediate_size=37,
-            num_attention_heads=4,
+            intermediate_size=24,
+            num_attention_heads=2,
             num_channels=3,
             num_hidden_layers=5,
             patch_size=1,
@@ -143,7 +149,7 @@ class ShapEImg2ImgPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         prior = self.dummy_prior
         image_encoder = self.dummy_image_encoder
         image_processor = self.dummy_image_processor
-        renderer = self.dummy_renderer
+        shap_e_renderer = self.dummy_renderer
 
         scheduler = HeunDiscreteScheduler(
             beta_schedule="exp",
@@ -157,14 +163,14 @@ class ShapEImg2ImgPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             "prior": prior,
             "image_encoder": image_encoder,
             "image_processor": image_processor,
-            "renderer": renderer,
+            "shap_e_renderer": shap_e_renderer,
             "scheduler": scheduler,
         }
 
         return components
 
     def get_dummy_inputs(self, device, seed=0):
-        input_image = floats_tensor((1, 3, 64, 64), rng=random.Random(seed)).to(device)
+        input_image = floats_tensor((1, 3, 32, 32), rng=random.Random(seed)).to(device)
 
         if str(device).startswith("mps"):
             generator = torch.manual_seed(seed)
@@ -175,7 +181,7 @@ class ShapEImg2ImgPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             "generator": generator,
             "num_inference_steps": 1,
             "frame_size": 32,
-            "output_type": "np",
+            "output_type": "latent",
         }
         return inputs
 
@@ -191,37 +197,24 @@ class ShapEImg2ImgPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
         output = pipe(**self.get_dummy_inputs(device))
         image = output.images[0]
-        image_slice = image[0, -3:, -3:, -1]
+        image_slice = image[-3:, -3:].cpu().numpy()
 
-        assert image.shape == (20, 32, 32, 3)
+        assert image.shape == (32, 16)
 
         expected_slice = np.array(
-            [
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-                0.00039216,
-            ]
+            [-1.0, 0.40668195, 0.57322013, -0.9469888, 0.4283227, 0.30348337, -0.81094897, 0.74555075, 0.15342723]
         )
 
         assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
 
     def test_inference_batch_consistent(self):
         # NOTE: Larger batch sizes cause this test to timeout, only test on smaller batches
-        self._test_inference_batch_consistent(batch_sizes=[1, 2])
+        self._test_inference_batch_consistent(batch_sizes=[2])
 
     def test_inference_batch_single_identical(self):
-        test_max_difference = torch_device == "cpu"
-        relax_max_difference = True
         self._test_inference_batch_single_identical(
             batch_size=2,
-            test_max_difference=test_max_difference,
-            relax_max_difference=relax_max_difference,
+            expected_max_diff=6e-3,
         )
 
     def test_num_images_per_prompt(self):
@@ -243,8 +236,18 @@ class ShapEImg2ImgPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
         assert images.shape[0] == batch_size * num_images_per_prompt
 
+    def test_float16_inference(self):
+        super().test_float16_inference(expected_max_diff=1e-1)
 
-@slow
+    def test_save_load_local(self):
+        super().test_save_load_local(expected_max_difference=5e-3)
+
+    @unittest.skip("Key error is raised with accelerate")
+    def test_sequential_cpu_offload_forward_pass(self):
+        pass
+
+
+@nightly
 @require_torch_gpu
 class ShapEImg2ImgPipelineIntegrationTests(unittest.TestCase):
     def tearDown(self):

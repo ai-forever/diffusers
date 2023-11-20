@@ -39,22 +39,24 @@ from diffusers import (
     StableDiffusionDepth2ImgPipeline,
     UNet2DConditionModel,
 )
-from diffusers.utils import (
+from diffusers.utils import is_accelerate_available, is_accelerate_version
+from diffusers.utils.testing_utils import (
+    enable_full_determinism,
     floats_tensor,
-    is_accelerate_available,
-    is_accelerate_version,
     load_image,
     load_numpy,
     nightly,
+    require_torch_gpu,
+    skip_mps,
     slow,
     torch_device,
 )
-from diffusers.utils.testing_utils import enable_full_determinism, require_torch_gpu, skip_mps
 
 from ..pipeline_params import (
     IMAGE_TO_IMAGE_IMAGE_PARAMS,
     TEXT_GUIDED_IMAGE_VARIATION_BATCH_PARAMS,
     TEXT_GUIDED_IMAGE_VARIATION_PARAMS,
+    TEXT_TO_IMAGE_CALLBACK_CFG_PARAMS,
     TEXT_TO_IMAGE_IMAGE_PARAMS,
 )
 from ..test_pipelines_common import PipelineKarrasSchedulerTesterMixin, PipelineLatentTesterMixin, PipelineTesterMixin
@@ -74,6 +76,7 @@ class StableDiffusionDepth2ImgPipelineFastTests(
     batch_params = TEXT_GUIDED_IMAGE_VARIATION_BATCH_PARAMS
     image_params = IMAGE_TO_IMAGE_IMAGE_PARAMS
     image_latents_params = TEXT_TO_IMAGE_IMAGE_PARAMS
+    callback_cfg_params = TEXT_TO_IMAGE_CALLBACK_CFG_PARAMS.union({"depth_mask"})
 
     def get_dummy_components(self):
         torch.manual_seed(0)
@@ -417,6 +420,7 @@ class StableDiffusionDepth2ImgPipelineSlowTests(unittest.TestCase):
         pipe = StableDiffusionDepth2ImgPipeline.from_pretrained(
             "stabilityai/stable-diffusion-2-depth", safety_checker=None
         )
+        pipe.unet.set_default_attn_processor()
         pipe.scheduler = LMSDiscreteScheduler.from_config(pipe.scheduler.config)
         pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)

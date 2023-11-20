@@ -11,7 +11,8 @@ from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.unet_2d_blocks import CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
-from diffusers.utils import is_compiled_module, logging, randn_tensor
+from diffusers.utils import logging
+from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -201,7 +202,7 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
-                [diffusers.cross_attention](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/cross_attention.py).
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             controlnet_conditioning_scale (`float` or `List[float]`, *optional*, defaults to 1.0):
                 The outputs of the controlnet are multiplied by `controlnet_conditioning_scale` before they are added
                 to the residual in the original unet. If multiple ControlNets are specified in init, you can set the
@@ -545,7 +546,7 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
 
             return hidden_states, output_states
 
-        def hacked_DownBlock2D_forward(self, hidden_states, temb=None):
+        def hacked_DownBlock2D_forward(self, hidden_states, temb=None, *args, **kwargs):
             eps = 1e-6
 
             output_states = ()
@@ -641,7 +642,9 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
 
             return hidden_states
 
-        def hacked_UpBlock2D_forward(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None):
+        def hacked_UpBlock2D_forward(
+            self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None, *args, **kwargs
+        ):
             eps = 1e-6
             for i, resnet in enumerate(self.resnets):
                 # pop res hidden states
@@ -801,7 +804,8 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        callback(step_idx, t, latents)
 
         # If we do sequential model offloading, let's offload unet and controlnet
         # manually for max memory savings

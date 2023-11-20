@@ -2,7 +2,7 @@ import inspect
 from typing import Callable, List, Optional, Union
 
 import numpy as np
-import PIL
+import PIL.Image
 import torch
 from transformers import CLIPImageProcessor, CLIPTokenizer
 
@@ -66,7 +66,9 @@ class OnnxStableDiffusionInpaintPipelineLegacy(DiffusionPipeline):
         feature_extractor ([`CLIPImageProcessor`]):
             Model that extracts features from generated images to be used as inputs for the `safety_checker`.
     """
+
     _optional_components = ["safety_checker", "feature_extractor"]
+    _is_onnx = True
 
     vae_encoder: OnnxRuntimeModel
     vae_decoder: OnnxRuntimeModel
@@ -502,7 +504,8 @@ class OnnxStableDiffusionInpaintPipelineLegacy(DiffusionPipeline):
 
             # call the callback, if provided
             if callback is not None and i % callback_steps == 0:
-                callback(i, t, latents)
+                step_idx = i // getattr(self.scheduler, "order", 1)
+                callback(step_idx, t, latents)
 
         latents = 1 / 0.18215 * latents
         # image = self.vae_decoder(latent_sample=latents)[0]

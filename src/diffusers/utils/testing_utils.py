@@ -1,12 +1,19 @@
+import functools
+import importlib
 import inspect
+import io
 import logging
 import multiprocessing
 import os
 import random
 import re
+import struct
+import sys
 import tempfile
+import time
 import unittest
 import urllib.parse
+from contextlib import contextmanager
 from distutils.util import strtobool
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -16,6 +23,7 @@ import numpy as np
 import PIL.Image
 import PIL.ImageOps
 import requests
+from numpy.linalg import norm
 from packaging import version
 
 from .import_utils import (
@@ -25,9 +33,11 @@ from .import_utils import (
     is_note_seq_available,
     is_onnx_available,
     is_opencv_available,
+    is_peft_available,
     is_torch_available,
     is_torch_version,
     is_torchsde_available,
+    is_transformers_available,
 )
 from .logging import get_logger
 
@@ -36,18 +46,27 @@ global_rng = random.Random()
 
 logger = get_logger(__name__)
 
+_required_peft_version = is_peft_available() and version.parse(
+    version.parse(importlib.metadata.version("peft")).base_version
+) > version.parse("0.5")
+_required_transformers_version = is_transformers_available() and version.parse(
+    version.parse(importlib.metadata.version("transformers")).base_version
+) > version.parse("4.33")
+
+USE_PEFT_BACKEND = _required_peft_version and _required_transformers_version
+
 if is_torch_available():
     import torch
 
     if "DIFFUSERS_TEST_DEVICE" in os.environ:
         torch_device = os.environ["DIFFUSERS_TEST_DEVICE"]
-
-        available_backends = ["cuda", "cpu", "mps"]
-        if torch_device not in available_backends:
-            raise ValueError(
-                f"unknown torch backend for diffusers tests: {torch_device}. Available backends are:"
-                f" {available_backends}"
-            )
+        try:
+            # try creating device to see if provided device is valid
+            _ = torch.device(torch_device)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Unknown testing device specified by environment variable `DIFFUSERS_TEST_DEVICE`: {torch_device}"
+            ) from e
         logger.info(f"torch_device overrode to {torch_device}")
     else:
         torch_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -67,6 +86,13 @@ def torch_all_close(a, b, *args, **kwargs):
     if not torch.allclose(a, b, *args, **kwargs):
         assert False, f"Max diff is absolute {(a - b).abs().max()}. Diff tensor is {(a - b).abs()}."
     return True
+
+
+def numpy_cosine_similarity_distance(a, b):
+    similarity = np.dot(a, b) / (norm(a) * norm(b))
+    distance = 1.0 - similarity.mean()
+
+    return distance
 
 
 def print_tensor_test(tensor, filename="test_corrections.txt", expected_tensor_name="expected_slice"):
@@ -225,6 +251,30 @@ def require_torchsde(test_case):
     return unittest.skipUnless(is_torchsde_available(), "test requires torchsde")(test_case)
 
 
+def require_peft_backend(test_case):
+    """
+    Decorator marking a test that requires PEFT backend, this would require some specific versions of PEFT and
+    transformers.
+    """
+    return unittest.skipUnless(USE_PEFT_BACKEND, "test requires PEFT backend")(test_case)
+
+
+def deprecate_after_peft_backend(test_case):
+    """
+    Decorator marking a test that will be skipped after PEFT backend
+    """
+    return unittest.skipUnless(not USE_PEFT_BACKEND, "test skipped in favor of PEFT backend")(test_case)
+
+
+def require_python39_or_higher(test_case):
+    def python39_available():
+        sys_info = sys.version_info
+        major, minor = sys_info.major, sys_info.minor
+        return major == 3 and minor >= 9
+
+    return unittest.skipUnless(python39_available(), "test requires Python 3.9 or higher")(test_case)
+
+
 def load_numpy(arry: Union[str, np.ndarray], local_path: Optional[str] = None) -> np.ndarray:
     if isinstance(arry, str):
         # local_path = "/home/patrick_huggingface_co/"
@@ -313,6 +363,85 @@ def export_to_gif(image: List[PIL.Image.Image], output_gif_path: str = None) -> 
         loop=0,
     )
     return output_gif_path
+
+
+@contextmanager
+def buffered_writer(raw_f):
+    f = io.BufferedWriter(raw_f)
+    yield f
+    f.flush()
+
+
+def export_to_ply(mesh, output_ply_path: str = None):
+    """
+    Write a PLY file for a mesh.
+    """
+    if output_ply_path is None:
+        output_ply_path = tempfile.NamedTemporaryFile(suffix=".ply").name
+
+    coords = mesh.verts.detach().cpu().numpy()
+    faces = mesh.faces.cpu().numpy()
+    rgb = np.stack([mesh.vertex_channels[x].detach().cpu().numpy() for x in "RGB"], axis=1)
+
+    with buffered_writer(open(output_ply_path, "wb")) as f:
+        f.write(b"ply\n")
+        f.write(b"format binary_little_endian 1.0\n")
+        f.write(bytes(f"element vertex {len(coords)}\n", "ascii"))
+        f.write(b"property float x\n")
+        f.write(b"property float y\n")
+        f.write(b"property float z\n")
+        if rgb is not None:
+            f.write(b"property uchar red\n")
+            f.write(b"property uchar green\n")
+            f.write(b"property uchar blue\n")
+        if faces is not None:
+            f.write(bytes(f"element face {len(faces)}\n", "ascii"))
+            f.write(b"property list uchar int vertex_index\n")
+        f.write(b"end_header\n")
+
+        if rgb is not None:
+            rgb = (rgb * 255.499).round().astype(int)
+            vertices = [
+                (*coord, *rgb)
+                for coord, rgb in zip(
+                    coords.tolist(),
+                    rgb.tolist(),
+                )
+            ]
+            format = struct.Struct("<3f3B")
+            for item in vertices:
+                f.write(format.pack(*item))
+        else:
+            format = struct.Struct("<3f")
+            for vertex in coords.tolist():
+                f.write(format.pack(*vertex))
+
+        if faces is not None:
+            format = struct.Struct("<B3I")
+            for tri in faces.tolist():
+                f.write(format.pack(len(tri), *tri))
+
+    return output_ply_path
+
+
+def export_to_obj(mesh, output_obj_path: str = None):
+    if output_obj_path is None:
+        output_obj_path = tempfile.NamedTemporaryFile(suffix=".obj").name
+
+    verts = mesh.verts.detach().cpu().numpy()
+    faces = mesh.faces.cpu().numpy()
+
+    vertex_colors = np.stack([mesh.vertex_channels[x].detach().cpu().numpy() for x in "RGB"], axis=1)
+    vertices = [
+        "{} {} {} {} {} {}".format(*coord, *color) for coord, color in zip(verts.tolist(), vertex_colors.tolist())
+    ]
+
+    faces = ["f {} {} {}".format(str(tri[0] + 1), str(tri[1] + 1), str(tri[2] + 1)) for tri in faces.tolist()]
+
+    combined_data = ["v " + vertex for vertex in vertices] + faces
+
+    with open(output_obj_path, "w") as f:
+        f.writelines("\n".join(combined_data))
 
 
 def export_to_video(video_frames: List[np.ndarray], output_video_path: str = None) -> str:
@@ -493,6 +622,43 @@ def pytest_terminal_summary_main(tr, id):
     tr._tw = orig_writer
     tr.reportchars = orig_reportchars
     config.option.tbstyle = orig_tbstyle
+
+
+# Copied from https://github.com/huggingface/transformers/blob/000e52aec8850d3fe2f360adc6fd256e5b47fe4c/src/transformers/testing_utils.py#L1905
+def is_flaky(max_attempts: int = 5, wait_before_retry: Optional[float] = None, description: Optional[str] = None):
+    """
+    To decorate flaky tests. They will be retried on failures.
+
+    Args:
+        max_attempts (`int`, *optional*, defaults to 5):
+            The maximum number of attempts to retry the flaky test.
+        wait_before_retry (`float`, *optional*):
+            If provided, will wait that number of seconds before retrying the test.
+        description (`str`, *optional*):
+            A string to describe the situation (what / where / why is flaky, link to GH issue/PR comments, errors,
+            etc.)
+    """
+
+    def decorator(test_func_ref):
+        @functools.wraps(test_func_ref)
+        def wrapper(*args, **kwargs):
+            retry_count = 1
+
+            while retry_count < max_attempts:
+                try:
+                    return test_func_ref(*args, **kwargs)
+
+                except Exception as err:
+                    print(f"Test failed with {err} at try {retry_count}/{max_attempts}.", file=sys.stderr)
+                    if wait_before_retry is not None:
+                        time.sleep(wait_before_retry)
+                    retry_count += 1
+
+            return test_func_ref(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 # Taken from: https://github.com/huggingface/transformers/blob/3658488ff77ff8d45101293e749263acf437f4d5/src/transformers/testing_utils.py#L1787

@@ -3,7 +3,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
-import PIL
+import PIL.Image
 import torch
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
@@ -21,8 +21,8 @@ from diffusers.utils import (
     is_accelerate_available,
     is_accelerate_version,
     logging,
-    randn_tensor,
 )
+from diffusers.utils.torch_utils import randn_tensor
 
 
 # ------------------------------------------------------------------------------
@@ -56,10 +56,10 @@ def parse_prompt_attention(text):
       (abc) - increases attention to abc by a multiplier of 1.1
       (abc:3.12) - increases attention to abc by a multiplier of 3.12
       [abc] - decreases attention to abc by a multiplier of 1.1
-      \( - literal character '('
-      \[ - literal character '['
-      \) - literal character ')'
-      \] - literal character ']'
+      \\( - literal character '('
+      \\[ - literal character '['
+      \\) - literal character ')'
+      \\] - literal character ']'
       \\ - literal character '\'
       anything else - just text
     >>> parse_prompt_attention('normal text')
@@ -68,7 +68,7 @@ def parse_prompt_attention(text):
     [['an ', 1.0], ['important', 1.1], [' word', 1.0]]
     >>> parse_prompt_attention('(unbalanced')
     [['unbalanced', 1.1]]
-    >>> parse_prompt_attention('\(literal\]')
+    >>> parse_prompt_attention('\\(literal\\]')
     [['(literal]', 1.0]]
     >>> parse_prompt_attention('(unnecessary)(parens)')
     [['unnecessaryparens', 1.1]]
@@ -967,7 +967,7 @@ class StableDiffusionLongPromptWeightingPipeline(
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
-                [diffusers.cross_attention](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/cross_attention.py).
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
 
         Returns:
             `None` if cancelled by `is_cancelled_callback`,
@@ -1088,7 +1088,8 @@ class StableDiffusionLongPromptWeightingPipeline(
                     progress_bar.update()
                     if i % callback_steps == 0:
                         if callback is not None:
-                            callback(i, t, latents)
+                            step_idx = i // getattr(self.scheduler, "order", 1)
+                            callback(step_idx, t, latents)
                         if is_cancelled_callback is not None and is_cancelled_callback():
                             return None
 
@@ -1202,7 +1203,7 @@ class StableDiffusionLongPromptWeightingPipeline(
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
-                [diffusers.cross_attention](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/cross_attention.py).
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
 
         Returns:
             `None` if cancelled by `is_cancelled_callback`,
@@ -1316,7 +1317,7 @@ class StableDiffusionLongPromptWeightingPipeline(
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
-                [diffusers.cross_attention](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/cross_attention.py).
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
 
         Returns:
             `None` if cancelled by `is_cancelled_callback`,
@@ -1437,7 +1438,7 @@ class StableDiffusionLongPromptWeightingPipeline(
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
-                [diffusers.cross_attention](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/cross_attention.py).
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
 
         Returns:
             `None` if cancelled by `is_cancelled_callback`,
